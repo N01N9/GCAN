@@ -1,0 +1,11 @@
+torch>=2.0.0
+torchaudio>=2.0.0
+numpy
+scipy
+tqdm
+tensorboard
+datasets
+huggingface_hub
+soundfile
+librosa
+torchcodec
