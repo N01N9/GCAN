@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch
+*.pt
+*.pth
+*.tar
+*.onnx
+
+# Data & Logs
+logs/
+exp/
+result.png
+*.wav
+*.mp3
+
+# Editor
+.vscode/
+.idea/
+
+# Environment
+.env
+venv/
+env/
