@@ -1,0 +1,9 @@
+torch>=2.0.0
+torchaudio>=2.0.0
+numpy
+scipy
+tqdm
+pyyaml
+speechbrain>=0.5.15
+soundfile
+huggingface_hub

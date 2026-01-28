@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+data/shards/
+vox1_dev_wav/
+vox1_test_wav/
+*.zip
+*.tar

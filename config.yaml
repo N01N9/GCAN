@@ -1,0 +1,38 @@
+# HR-GridMamba Data Configuration
+
+data:
+  sample_rate: 16000
+  duration: 20.0 # seconds
+  n_samples: 320000 # 16000 * 20
+  
+  paths:
+    train:
+      vox1_dev: "/workspace/vox1_dev_wav"
+      vox2_aac_1: "/workspace/vox2_aac_1" 
+      vox2_aac_2: "/workspace/vox2_aac_2"
+    test:
+      vox1_test: "/workspace/vox1_test_wav"
+      vox2_test: "/workspace/vox2_test_aac"
+  mixing:
+    max_speakers: 4
+    probabilities:
+      n_speakers:
+        1: 0.1
+        2: 0.3
+        3: 0.3
+        4: 0.3
+      hard_negative: 0.3 # Still keep hard negative (similar voice) logic
+      overlap:
+        full: 0.5
+        partial: 0.3
+        none: 0.2
+    
+    # snr:    <-- Disabled
+    #   min: 10
+    #   max: 20
+    
+    gain_diff: 5 # dB
+
+preprocess:
+  embedding_model: "speechbrain/spkrec-ecapa-voxceleb" # For hard negative mining
+  output_path: "data/meta"
