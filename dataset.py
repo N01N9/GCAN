@@ -108,6 +108,10 @@ class HuggingFaceDiarizationDataset(IterableDataset):
         all_files = list_repo_files(repo_id, repo_type="dataset")
         all_tar_shards = sorted([f for f in all_files if f.endswith(".tar") and "train" in f])
         
+        # Fallback: if no "train" specific shards, take all .tar files
+        if not all_tar_shards:
+            all_tar_shards = sorted([f for f in all_files if f.endswith(".tar")])
+        
         if not all_tar_shards:
             raise ValueError(f"No tar files found in repo '{repo_id}'")
         
@@ -131,17 +135,54 @@ class HuggingFaceDiarizationDataset(IterableDataset):
         ).cast_column("wav", Audio(sampling_rate=sample_rate))
         
         # Load metadata
-        meta_stream = load_dataset(
-            repo_id, 
-            data_files="metadata.jsonl", 
-            split="train", 
-            streaming=True
-        )
+        # Auto-detect metadata file
+        meta_file = "metadata.jsonl"
+        found_meta = True
         
-        self.meta = {}
-        for item in meta_stream:
-            key = os.path.basename(item["file_name"]).replace(".wav", "")
-            self.meta[key] = item["utterances"]
+        if "metadata.jsonl" not in all_files:
+            # Try to find any jsonl file that looks like metadata
+            candidates = [f for f in all_files if "metadata" in f and f.endswith(".jsonl")]
+            if candidates:
+                meta_file = candidates[0]
+                print(f"⚠️ 'metadata.jsonl' not found. Using '{meta_file}' instead.")
+            else:
+                # If definitely no metadata file, we will proceed without global metadata
+                print(f"❌ Error: 'metadata.jsonl' not found in repo '{repo_id}'")
+                print(f"   Available files (first 10): {all_files[:10]}")
+                print("⚠️ Proceeding without global metadata. Will attempt to read metadata from stream.")
+                found_meta = False
+        
+        self.meta = None
+        if found_meta:
+            try:
+                meta_stream = load_dataset(
+                    repo_id, 
+                    data_files=meta_file, 
+                    split="train", 
+                    streaming=True
+                )
+                
+                print("Loading metadata...")
+                self.meta = {}
+                # Try to use tqdm if available
+                try:
+                    from tqdm import tqdm
+                    iterator = tqdm(meta_stream, desc="Loading Metadata")
+                except ImportError:
+                    iterator = meta_stream
+                    
+                count = 0
+                for item in iterator:
+                    key = os.path.basename(item["file_name"]).replace(".wav", "")
+                    self.meta[key] = item["utterances"]
+                    count += 1
+                    if count % 1000 == 0:
+                        print(f"Loaded {count} metadata entries...", end='\r')
+                print(f"\nTotal metadata entries: {len(self.meta)}")
+            except Exception as e:
+                print(f"⚠️ Failed to load metadata file: {e}")
+                print("⚠️ Proceeding without global metadata.")
+                self.meta = None
         
         self.sample_rate = sample_rate
         self.max_samples = int(sample_rate * duration)
@@ -169,16 +210,46 @@ class HuggingFaceDiarizationDataset(IterableDataset):
         
         print(f"Initialized dataset: {repo_id} ({split})")
         print(f"  Selected {len(selected_shards)} / {len(all_tar_shards)} shards")
-        print(f"  Loaded metadata for {len(self.meta)} files")
+        if self.meta:
+            print(f"  Loaded metadata for {len(self.meta)} files")
+        else:
+            print(f"  Metadata mode: Stream (Global metadata file not found)")
         print(f"  Augmentation: {augmentation}, SpecAugment: {spec_augment}, Mixup: {mixup}")
     
     def __iter__(self):
         """Iterate over dataset samples"""
         for item in self.audio_ds:
-            audio_path = item.get("file_name", "") or item["wav"].get("path", "")
+
+            # Safe access to audio path
+            audio_path = ""
+            if "file_name" in item:
+                audio_path = item["file_name"]
+            elif "wav" in item and isinstance(item["wav"], dict):
+                 audio_path = item["wav"].get("path", "")
+            elif "__key__" in item:
+                audio_path = item["__key__"]
+            
             key = os.path.basename(audio_path).replace(".wav", "")
             
-            if key not in self.meta:
+            utterances = None
+            if self.meta is not None:
+                if key in self.meta:
+                    utterances = self.meta[key]
+            else:
+                # Try to get metadata from the item itself (WebDataset style)
+                if "json" in item:
+                    data = item["json"]
+                    # Handle different potential structures
+                    if isinstance(data, dict):
+                        if "utterances" in data:
+                            utterances = data["utterances"]
+                        else:
+                            utterances = data.get("utterances", []) 
+                    elif isinstance(data, list):
+                        utterances = data
+            
+            if utterances is None:
+                # Skip if no metadata found
                 continue
             
             # Load audio
@@ -195,7 +266,7 @@ class HuggingFaceDiarizationDataset(IterableDataset):
                 audio = F.pad(audio, (0, self.max_samples - audio.numel()))
             
             # Create targets
-            targets = self._create_targets(self.meta[key])
+            targets = self._create_targets(utterances)
             
             # Apply basic augmentation
             if self.augmentation and self.split == "train":

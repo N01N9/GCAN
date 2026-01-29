@@ -1,294 +1,273 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio
-import math
+from mamba_ssm import Mamba2
+from itertools import permutations
 
+# ==============================================================================
+# 1. Bidirectional Mamba Wrapper (New!)
+# ==============================================================================
 
-class SpectralStream(nn.Module):
-    """Enhanced Spectral Stream with deeper residual blocks"""
-    def __init__(self, hidden_dim: int, dropout: float = 0.1):
+class BiMamba(nn.Module):
+    """
+    Mamba2를 양방향(Bidirectional)으로 동작하게 만드는 래퍼입니다.
+    순방향(Forward)과 역방향(Backward)의 결과를 합쳐 문맥 정보를 강화합니다.
+    """
+    def __init__(self, d_model, d_state=64, d_conv=4, expand=2):
         super().__init__()
-        self.conv3x3 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
-        self.conv5x5 = nn.Conv2d(1, 16, kernel_size=5, padding=2)
-        self.conv7x7 = nn.Conv2d(1, 16, kernel_size=7, padding=3)
-        self.skip_proj = nn.Conv2d(48, 64, kernel_size=1)
+        # Forward direction
+        self.fwd_mamba = Mamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+        # Backward direction
+        self.bwd_mamba = Mamba2(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
         
-        # Enhanced residual blocks (2 blocks instead of 1)
-        self.res_block1 = nn.Sequential(
-            nn.Conv2d(48, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64), nn.ReLU(),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64)
-        )
-        self.res_block2 = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64), nn.ReLU(),
-            nn.Dropout2d(dropout),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64)
-        )
-        self.proj = nn.Linear(64 * 80, hidden_dim)
-        self.dropout = nn.Dropout(dropout)
+        # 결과를 합친 후 차원 축소 (Concat -> Linear) 대신
+        # 여기서는 메모리 효율을 위해 단순히 더하는(Add) 방식을 사용하거나
+        # Linear로 섞어줍니다. 여기서는 Linear Fusion을 사용합니다.
+        self.fusion = nn.Linear(d_model * 2, d_model)
 
-    def forward(self, mel: torch.Tensor):
-        feat = torch.cat([self.conv3x3(mel), self.conv5x5(mel), self.conv7x7(mel)], dim=1)
-        res1 = self.res_block1(feat)
-        out1 = F.relu(self.skip_proj(feat) + res1)
-        res2 = self.res_block2(out1)
-        out = F.relu(out1 + res2)
-        B, C, T, F_bins = out.shape
-        out = out.permute(0, 2, 1, 3).reshape(B, T, -1)
-        return self.dropout(self.proj(out))
-
-
-class ProsodicStream(nn.Module):
-    """Enhanced Prosodic Stream with 2-layer Bi-LSTM"""
-    def __init__(self, hidden_dim: int, dropout: float = 0.1):
-        super().__init__()
-        self.lstm = nn.LSTM(
-            4, hidden_dim // 2, 
-            num_layers=2,  # Increased from 1 to 2
-            batch_first=True, 
-            bidirectional=True,
-            dropout=dropout
-        )
-        self.layer_norm = nn.LayerNorm(hidden_dim)
-        
-    def forward(self, audio: torch.Tensor):
-        frames = audio.unfold(1, 512, 160)
-        e = torch.log(frames.pow(2).mean(-1) + 1e-6)
-        z = (audio.sign().diff().abs() > 0).float().unfold(1, 512, 160).mean(-1)
-        ed, zd = F.pad(e[:, 1:]-e[:, :-1], (1,0)), F.pad(z[:, 1:]-z[:, :-1], (1,0))
-        out, _ = self.lstm(torch.stack([e, z, ed, zd], dim=-1))
-        return self.layer_norm(out)
-
-
-class RhythmStream(nn.Module):
-    """Enhanced Rhythm Stream with deeper TCN"""
-    def __init__(self, hidden_dim: int, dropout: float = 0.1):
-        super().__init__()
-        self.tcn = nn.Sequential(
-            nn.Conv1d(1, 64, 5, padding=2), 
-            nn.BatchNorm1d(64),
-            nn.ReLU(), 
-            nn.Dropout(dropout),
-            nn.Conv1d(64, 128, 5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Conv1d(128, hidden_dim, 5, padding=2)
-        )
-        self.layer_norm = nn.LayerNorm(hidden_dim)
-        
-    def forward(self, audio: torch.Tensor):
-        z = (audio.sign().diff().abs() > 0).float().unfold(1, 512, 160).mean(-1).unsqueeze(1)
-        out = self.tcn(z).transpose(1, 2)
-        return self.layer_norm(out)
-
-
-class EnergyStream(nn.Module):
-    """Enhanced Energy Stream with MLP"""
-    def __init__(self, hidden_dim: int, dropout: float = 0.1):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(4, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, hidden_dim)
-        )
-        self.layer_norm = nn.LayerNorm(hidden_dim)
-        
-    def forward(self, audio: torch.Tensor):
-        s = torch.stft(audio, n_fft=512, hop_length=160, return_complex=True, 
-                       window=torch.hann_window(512).to(audio.device)).abs()
-        x = torch.stack([s[:,:8,:].mean(1), s[:,8:32,:].mean(1), 
-                         s[:,32:64,:].mean(1), s[:,64:,:].mean(1)], dim=-1)
-        return self.layer_norm(self.mlp(x))
-
-
-class PhoneticStream(nn.Module):
-    """Enhanced Phonetic Stream with multi-scale convolutions"""
-    def __init__(self, hidden_dim: int, dropout: float = 0.1):
-        super().__init__()
-        self.conv1 = nn.Conv1d(1, hidden_dim // 2, 64, stride=160, padding=32)
-        self.conv2 = nn.Conv1d(1, hidden_dim // 2, 128, stride=160, padding=64)
-        self.proj = nn.Linear(hidden_dim, hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = nn.LayerNorm(hidden_dim)
-        
-    def forward(self, audio: torch.Tensor):
-        c1 = self.conv1(audio.unsqueeze(1)).transpose(1, 2)
-        c2 = self.conv2(audio.unsqueeze(1)).transpose(1, 2)
-        # Align sizes
-        min_len = min(c1.size(1), c2.size(1))
-        out = torch.cat([c1[:, :min_len], c2[:, :min_len]], dim=-1)
-        return self.layer_norm(self.dropout(self.proj(out)))
-
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000, dropout=0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(dropout)
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe.unsqueeze(0))
-        
     def forward(self, x):
-        return self.dropout(x + self.pe[:, :x.size(1)])
+        # x: [Batch, Seq, Dim]
+        
+        # 1. Forward Pass
+        out_fwd = self.fwd_mamba(x)
+        
+        # 2. Backward Pass (Flip sequence -> Mamba -> Flip back)
+        out_bwd = self.bwd_mamba(x.flip(dims=[1])).flip(dims=[1])
+        
+        # 3. Fusion
+        out = torch.cat([out_fwd, out_bwd], dim=-1)
+        return self.fusion(out)
 
+# ==============================================================================
+# 2. Grid-Mamba Block (Improved)
+# ==============================================================================
 
-class MultiLayerAttractorDecoder(nn.Module):
-    """Enhanced Multi-Layer Attractor Decoder with iterative refinement"""
-    def __init__(self, num_speakers, hidden_dim, num_layers=3, num_heads=8, dropout=0.1):
+class GridMambaBlock(nn.Module):
+    def __init__(self, d_model, d_state=64, d_conv=4, expand=2, dilation=1):
         super().__init__()
-        self.num_layers = num_layers
-        self.query_embed = nn.Embedding(num_speakers, hidden_dim)
         
-        # Multi-layer decoder
-        self.self_attn_layers = nn.ModuleList([
-            nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True, dropout=dropout)
-            for _ in range(num_layers)
-        ])
-        self.cross_attn_layers = nn.ModuleList([
-            nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True, dropout=dropout)
-            for _ in range(num_layers)
-        ])
-        self.norm1_layers = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
-        self.norm2_layers = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
-        self.norm3_layers = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
-        
-        # FFN layers
-        self.ffn_layers = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim * 4),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim * 4, hidden_dim),
-                nn.Dropout(dropout)
-            ) for _ in range(num_layers)
-        ])
-        
-    def forward(self, context_feat):
-        B = context_feat.size(0)
-        queries = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)
-        
-        for i in range(self.num_layers):
-            # Self-attention
-            q2, _ = self.self_attn_layers[i](queries, queries, queries)
-            queries = self.norm1_layers[i](queries + q2)
-            
-            # Cross-attention with context
-            q3, _ = self.cross_attn_layers[i](queries, context_feat, context_feat)
-            queries = self.norm2_layers[i](queries + q3)
-            
-            # FFN
-            queries = self.norm3_layers[i](queries + self.ffn_layers[i](queries))
-        
-        return queries
+        # 1. Frequency Axis (Bi-Mamba)
+        self.freq_mamba = BiMamba(d_model, d_state, d_conv, expand)
+        self.freq_norm = nn.LayerNorm(d_model)
+        self.dilation = dilation
 
+        # 2. Time Axis (Bi-Mamba)
+        self.time_mamba = BiMamba(d_model, d_state, d_conv, expand)
+        self.time_norm = nn.LayerNorm(d_model)
 
-class RefinedMultiStreamGCAN(nn.Module):
-    """Enhanced GCAN with deeper architecture and improved components"""
-    def __init__(self, num_speakers=6, hidden_dim=256, num_transformer_layers=6, dropout=0.1):
+    def forward(self, x):
+        """
+        Input: [B, C, T, F]
+        """
+        B, C, T, F = x.shape
+        
+        # --- Path 1: Frequency Axis (Harmonic Scan with Dilation) ---
+        # [B, C, T, F] -> [B*T, F, C]
+        x_freq = x.permute(0, 2, 3, 1).contiguous().view(B*T, F, C)
+        
+        # Dilation Trick
+        if self.dilation > 1:
+            pad = (self.dilation - (F % self.dilation)) % self.dilation
+            if pad > 0:
+                x_freq = F.pad(x_freq, (0, 0, 0, pad)) # F 차원 패딩
+            F_pad = x_freq.shape[1]
+            
+            # Reshape for dilation: [BT, F//D, D, C] -> [BT*D, F//D, C]
+            x_freq = x_freq.view(B*T, F_pad // self.dilation, self.dilation, C)
+            x_freq = x_freq.permute(0, 2, 1, 3).contiguous().view(B*T*self.dilation, F_pad // self.dilation, C)
+            
+        x_freq_out = self.freq_mamba(self.freq_norm(x_freq))
+        
+        # Dilation Restore
+        if self.dilation > 1:
+            x_freq_out = x_freq_out.view(B*T, self.dilation, -1, C).permute(0, 2, 1, 3).contiguous()
+            x_freq_out = x_freq_out.view(B*T, F_pad, C)
+            x_freq_out = x_freq_out[:, :F, :] # Remove padding
+            
+        # Residual Connection
+        # [BT, F, C] -> [B, T, F, C] -> [B, C, T, F]
+        x = x + x_freq_out.view(B, T, F, C).permute(0, 3, 1, 2)
+
+        # --- Path 2: Time Axis (Context Scan) ---
+        # [B, C, T, F] -> [B*F, T, C]
+        x_time = x.permute(0, 3, 2, 1).contiguous().view(B*F, T, C)
+        x_time = self.time_mamba(self.time_norm(x_time))
+        
+        # Residual Connection
+        x = x + x_time.view(B, F, T, C).permute(0, 3, 2, 1)
+
+        return x
+
+# ==============================================================================
+# 3. Refined HR-GridMamba Main Model
+# ==============================================================================
+
+class HR_GridMamba(nn.Module):
+    def __init__(
+        self, 
+        n_srcs=2,           # 화자 수
+        n_fft=256,          # FFT 크기 (보통 256 or 512)
+        stride=128,         # Hop length
+        d_model=128,        # 내부 채널 수
+        n_layers=6,         # 블록 수
+        dropout=0.1
+    ):
         super().__init__()
-        self.num_speakers = num_speakers
+        self.n_srcs = n_srcs
+        self.kernel_size = n_fft
+        self.stride = stride
+        self.d_model = d_model
         
-        # 5 Enhanced Streams
-        self.s1 = SpectralStream(hidden_dim, dropout)
-        self.s2 = ProsodicStream(hidden_dim, dropout)
-        self.s3 = RhythmStream(hidden_dim, dropout)
-        self.s4 = EnergyStream(hidden_dim, dropout)
-        self.s5 = PhoneticStream(hidden_dim, dropout)
-        
-        # Positional encoding with dropout
-        self.pos_encoder = PositionalEncoding(hidden_dim, dropout=dropout)
-        
-        # Feature fusion with layer norm
-        self.fusion = nn.Linear(hidden_dim * 5, hidden_dim)
-        self.fusion_norm = nn.LayerNorm(hidden_dim)
-        
-        # Enhanced Transformer Encoder (6 layers)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, 
-            nhead=8, 
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            batch_first=True,
-            activation='gelu'
+        # 1. Complex Encoder (STFT -> Embed)
+        self.input_conv = nn.Sequential(
+            nn.Conv2d(2, d_model, kernel_size=1),
+            nn.GroupNorm(4, d_model),
+            nn.PReLU()
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
-        
-        # Multi-layer Attractor Decoder
-        self.attractor_decoder = MultiLayerAttractorDecoder(
-            num_speakers, hidden_dim, num_layers=3, dropout=dropout
-        )
-        
-        # Projection heads with layer norm
-        self.spk_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim)
-        )
-        self.frm_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim)
-        )
-        
-        # Learnable temperature parameter
-        self.log_temperature = nn.Parameter(torch.tensor(0.0))  # exp(0) = 1.0 initial
-        
-        # Mel spectrogram transform
-        self.mel_trans = torchaudio.transforms.MelSpectrogram(sample_rate=16000, n_mels=80)
 
-    def forward(self, audio: torch.Tensor):
-        B = audio.shape[0]
-        mel = self.mel_trans(audio).unsqueeze(1).transpose(2, 3)
+        # 2. Grid Blocks with Dilation Cycle
+        self.layers = nn.ModuleList([])
+        for i in range(n_layers):
+            # Dilation: 1 -> 2 -> 4 -> 1 ...
+            dilation = 2 ** (i % 3) 
+            self.layers.append(
+                GridMambaBlock(d_model=d_model, dilation=dilation)
+            )
+
+        # 3. Mask Generator (Complex Masking)
+        # [B, C, T, F] -> [B, n_srcs * 2, T, F] (2 for Real/Imag)
+        self.mask_conv = nn.Sequential(
+            nn.Conv2d(d_model, d_model, 1),
+            nn.PReLU(),
+            nn.Conv2d(d_model, n_srcs * 2, 1) 
+        )
+
+    def forward(self, x):
+        """
+        x: [Batch, Time] (Raw Waveform)
+        """
+        # 1. STFT
+        # Return: [B, F, T] (Complex)
+        X_stft = torch.stft(
+            x, 
+            n_fft=self.kernel_size, 
+            hop_length=self.stride, 
+            window=torch.hann_window(self.kernel_size).to(x.device),
+            return_complex=True
+        )
         
-        # Extract features from all streams
-        f = [self.s1(mel), self.s2(audio), self.s3(audio), self.s4(audio), self.s5(audio)]
-        T = f[1].size(1)
+        # [B, F, T] -> [B, 2, F, T] (Real/Imag)
+        X_stft_view = torch.view_as_real(X_stft).permute(0, 3, 2, 1) 
         
-        # Align temporal dimensions
-        f_aligned = [
-            F.interpolate(x.transpose(1, 2), size=T, mode='linear', align_corners=False).transpose(1, 2) 
-            for x in f
-        ]
+        # 2. Embed: [B, 2, F, T] -> [B, C, T, F]
+        fea = self.input_conv(X_stft_view.permute(0, 1, 3, 2))
         
-        # Fuse and encode
-        fused = self.fusion_norm(self.fusion(torch.cat(f_aligned, dim=-1)))
-        x = self.pos_encoder(fused)
-        x = self.transformer(x)
+        # 3. Processing
+        for layer in self.layers:
+            fea = layer(fea)
+            
+        # 4. Mask Estimation
+        # Output: [B, n_srcs*2, T, F]
+        mask_out = self.mask_conv(fea)
         
-        # Decode attractors
-        attractors = self.attractor_decoder(x)
+        # Reshape: [B, n_srcs, 2, T, F]
+        B, _, T, F = mask_out.shape
+        mask_out = mask_out.view(B, self.n_srcs, 2, T, F)
         
-        # Project for similarity computation
-        att_p = F.normalize(self.spk_proj(attractors), p=2, dim=-1, eps=1e-6)
-        frm_p = F.normalize(self.frm_proj(x), p=2, dim=-1, eps=1e-6)
+        # --- [CRITICAL FIX] Complex Masking ---
+        # 실수부(Real)와 허수부(Imag) 마스크를 각각 추출
+        mask_real = mask_out[:, :, 0] # [B, K, T, F]
+        mask_imag = mask_out[:, :, 1] # [B, K, T, F]
         
-        # Learnable temperature (clamped for stability)
-        temperature = torch.clamp(self.log_temperature.exp(), min=0.05, max=2.0)
+        # 복소수 마스크 생성 (Complex Tensor)
+        # SOTA 모델들(DCCRN 등)에서 사용하는 Unbounded Complex Masking
+        # 필요하다면 tanh로 범위를 제한할 수도 있음: torch.tanh(mask_real)
+        complex_mask = torch.complex(mask_real, mask_imag) # [B, K, T, F]
         
-        # Compute assignments
-        assignments = torch.bmm(frm_p, att_p.transpose(1, 2)) / temperature
-        assignments = torch.clamp(assignments, min=-15.0, max=15.0)
+        # Freq, Time 축 순서 원복: [B, K, F, T]
+        complex_mask = complex_mask.permute(0, 1, 3, 2)
         
-        # Existence logits
-        existence = assignments.max(dim=1)[0]
-        existence = torch.clamp(existence, min=-15.0, max=15.0)
+        # 5. Apply Mask & ISTFT
+        separated_audios = []
         
-        # Overlap detection (multi-speaker frames)
-        probs = torch.sigmoid(assignments)
-        overlap_logits = (probs.sum(dim=-1) - 1).clamp(min=0)  # >1 means overlap
+        # Input STFT: [B, F, T] -> [B, 1, F, T] for broadcasting
+        X_stft_expanded = X_stft.unsqueeze(1) 
         
-        return {
-            'assignments': assignments, 
-            'existence': existence, 
-            'attractors': attractors,
-            'overlap_logits': overlap_logits,
-            'temperature': temperature
-        }
+        # Complex Multiplication: (Input) * (Mask)
+        # [B, 1, F, T] * [B, K, F, T] -> [B, K, F, T]
+        est_stft = X_stft_expanded * complex_mask
+        
+        for i in range(self.n_srcs):
+            # iSTFT
+            source_time = torch.istft(
+                est_stft[:, i], 
+                n_fft=self.kernel_size, 
+                hop_length=self.stride, 
+                window=torch.hann_window(self.kernel_size).to(x.device),
+                length=x.shape[-1]
+            )
+            separated_audios.append(source_time)
+            
+        # [Batch, n_srcs, Time]
+        return torch.stack(separated_audios, dim=1)
+
+# ==============================================================================
+# 4. Loss Functions (Unchanged but verified)
+# ==============================================================================
+
+def si_snr(preds, targets):
+    eps = 1e-8
+    preds = preds - torch.mean(preds, dim=-1, keepdim=True)
+    targets = targets - torch.mean(targets, dim=-1, keepdim=True)
+    
+    t_energy = torch.sum(targets ** 2, dim=-1, keepdim=True) + eps
+    projection = torch.sum(targets * preds, dim=-1, keepdim=True) * targets / t_energy
+    
+    noise = preds - projection
+    ratio = torch.sum(projection ** 2, dim=-1) / (torch.sum(noise ** 2, dim=-1) + eps)
+    return 10 * torch.log10(ratio + eps)
+
+def pit_loss(preds, targets, n_srcs=2):
+    """
+    PIT Loss with automatic padding for fewer active speakers
+    """
+    B, _, T = preds.shape
+    num_targets = targets.shape[1]
+    
+    if num_targets < n_srcs:
+        pad = torch.zeros((B, n_srcs - num_targets, T), device=targets.device)
+        targets = torch.cat([targets, pad], dim=1)
+        
+    perms = list(permutations(range(n_srcs)))
+    loss_candidates = []
+    
+    for p in perms:
+        snr = si_snr(preds[:, p, :].reshape(-1, T), targets.reshape(-1, T))
+        loss_candidates.append(-torch.mean(snr))
+        
+    loss_candidates = torch.stack(loss_candidates)
+    min_loss, _ = torch.min(loss_candidates, dim=0)
+    return min_loss
+
+# ==============================================================================
+# Run Test
+# ==============================================================================
+if __name__ == "__main__":
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Testing on {device}")
+
+    # 모델 생성
+    model = HR_GridMamba(n_srcs=4, d_model=256, n_layers=6).to(device)
+    
+    # 1.6초 길이의 오디오 (16000sr * 1.6 = 25600)
+    dummy_input = torch.randn(2, 25600).to(device)
+    
+    # Forward
+    output = model(dummy_input)
+    print(f"Input shape: {dummy_input.shape}")
+    print(f"Output shape: {output.shape}") # Expected: [2, 2, 25600]
+    
+    # Loss Calculation
+    dummy_target = torch.randn(2, 2, 25600).to(device)
+    loss = pit_loss(output, dummy_target, n_srcs=2)
+    print(f"PIT Loss: {loss.item()}")

@@ -11,13 +11,13 @@ def test_model_architecture():
     print("Testing Model Architecture")
     print("=" * 50)
     
-    from model import RefinedMultiStreamGCAN
+    from model import HR_GridMamba
     
     # Create model with new parameters
-    model = RefinedMultiStreamGCAN(
-        num_speakers=6, 
-        hidden_dim=256,
-        num_transformer_layers=6,
+    model = HR_GridMamba(
+        n_srcs=6, 
+        d_model=256,
+        n_layers=6,
         dropout=0.1
     )
     model.eval()
@@ -37,18 +37,18 @@ def test_model_architecture():
         out = model(x)
     
     print(f"\nInput shape: {x.shape}")
-    print(f"Assignments shape: {out['assignments'].shape}")
-    print(f"Existence shape: {out['existence'].shape}")
-    print(f"Attractors shape: {out['attractors'].shape}")
-    print(f"Overlap logits shape: {out['overlap_logits'].shape}")
-    print(f"Learnable temperature: {out['temperature'].item():.4f}")
+    print(f"Output shape: {out.shape}")
     
-    # Check logit range
-    logits = out['assignments']
-    print(f"\nLogits range: [{logits.min().item():.3f}, {logits.max().item():.3f}]")
+    # Check output shape [B, n_srcs, Time]
+    expected_shape = (batch_size, 6, audio_length)
+    if out.shape != expected_shape:
+        print(f"❌ Output shape mismatch! Expected {expected_shape}, got {out.shape}")
+        return False
+        
+    print(f"Output range: [{out.min().item():.3f}, {out.max().item():.3f}]")
     
     # Check for NaN
-    has_nan = any(torch.isnan(v).any() if isinstance(v, torch.Tensor) else False for v in out.values())
+    has_nan = torch.isnan(out).any()
     print(f"Has NaN: {has_nan}")
     
     print("\n✓ Model architecture test PASSED")
@@ -61,48 +61,24 @@ def test_loss_function():
     print("Testing Loss Function")
     print("=" * 50)
     
-    from model import RefinedMultiStreamGCAN
-    from loss import GCANLoss, FocalLoss, ContrastiveLoss
+    from model import HR_GridMamba, pit_loss
     
-    # Create model and loss
-    model = RefinedMultiStreamGCAN(num_speakers=6, hidden_dim=256)
-    criterion = GCANLoss(
-        lambda_existence=1.0,
-        lambda_ortho=0.1,
-        lambda_contrastive=0.1,
-        lambda_overlap=0.5,
-        label_smoothing=0.1,
-        focal_gamma=2.0
-    )
+    # Create model
+    model = HR_GridMamba(n_srcs=4, d_model=64).eval()
     
-    model.eval()
-    
-    # Create dummy data
+    # Create dummy outputs (waveforms) [B, n_srcs, T]
     batch_size = 2
-    x = torch.randn(batch_size, 32000)
+    T = 32000
+    outputs = torch.randn(batch_size, 4, T)
     
-    with torch.no_grad():
-        outputs = model(x)
-    
-    # Create dummy targets
-    T = outputs['assignments'].shape[1]
-    targets = {
-        'speaker_labels': torch.randint(0, 2, (batch_size, T, 6)).float(),
-        'num_speakers': torch.tensor([3, 4]),
-        'overlap_regions': torch.randint(0, 2, (batch_size, T)).float()
-    }
+    # Create dummy targets [B, n_active, T]
+    # Test case where active speakers < n_srcs
+    targets = torch.randn(batch_size, 2, T)
     
     # Compute loss
-    loss, loss_dict = criterion(outputs, targets)
+    loss = pit_loss(outputs, targets, n_srcs=4)
     
-    print(f"Total loss: {loss.item():.4f}")
-    print(f"  - Assignment loss: {loss_dict['assign']:.4f}")
-    print(f"  - Existence loss: {loss_dict['exist']:.4f}")
-    print(f"  - Orthogonality loss: {loss_dict['ortho']:.4f}")
-    print(f"  - Contrastive loss: {loss_dict['contrastive']:.4f}")
-    print(f"  - Overlap loss: {loss_dict['overlap']:.4f}")
-    print(f"  - Frame accuracy: {loss_dict['frame_acc']:.4f}")
-    print(f"  - Speaker num accuracy: {loss_dict['spk_num_acc']:.4f}")
+    print(f"PIT Loss value: {loss.item():.4f}")
     
     # Check for NaN
     has_nan = torch.isnan(loss)
@@ -143,27 +119,20 @@ def test_backward_pass():
     print("Testing Backward Pass")
     print("=" * 50)
     
-    from model import RefinedMultiStreamGCAN
-    from loss import GCANLoss
+    from model import HR_GridMamba, pit_loss
     
-    model = RefinedMultiStreamGCAN(num_speakers=6, hidden_dim=256)
-    criterion = GCANLoss()
-    
+    model = HR_GridMamba(n_srcs=4, d_model=64)
     model.train()
     
     # Forward pass
     x = torch.randn(2, 32000)
     outputs = model(x)
     
-    T = outputs['assignments'].shape[1]
-    targets = {
-        'speaker_labels': torch.randint(0, 2, (2, T, 6)).float(),
-        'num_speakers': torch.tensor([3, 4]),
-        'overlap_regions': torch.randint(0, 2, (2, T)).float()
-    }
+    # Create valid target
+    targets = torch.randn(2, 2, 32000)
     
     # Backward pass
-    loss, _ = criterion(outputs, targets)
+    loss = pit_loss(outputs, targets, n_srcs=4)
     loss.backward()
     
     # Check gradients
@@ -195,7 +164,6 @@ def main():
     tests = [
         ("Model Architecture", test_model_architecture),
         ("Loss Function", test_loss_function),
-        ("Focal Loss", test_focal_loss),
         ("Backward Pass", test_backward_pass),
     ]
     

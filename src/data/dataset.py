@@ -49,7 +49,9 @@ class HRGridMambaDataset(Dataset):
 
     def _load_audio(self, path):
         try:
-            if not os.path.exists(path): return torch.zeros(self.n_samples)
+            if not os.path.exists(path): 
+                print(f"❌ File not found: {path}")
+                return torch.zeros(self.n_samples)
             info = torchaudio.info(path)
             sr = info.sample_rate
             

@@ -9,7 +9,7 @@ from datetime import datetime
 import math
 
 # Import modules
-from model import RefinedMultiStreamGCAN
+from model import HR_GridMamba
 from loss import GCANLoss, DiarizationMetrics
 from dataset import create_dataloaders 
 
@@ -324,10 +324,10 @@ def main(args):
     )
     
     # Initialize model with new parameters
-    model = RefinedMultiStreamGCAN(
-        num_speakers=args.num_slots, 
-        hidden_dim=args.hidden_dim,
-        num_transformer_layers=args.num_transformer_layers,
+    model = HR_GridMamba(
+        n_srcs=args.num_slots, 
+        d_model=args.hidden_dim,
+        n_layers=args.num_transformer_layers,
         dropout=args.dropout
     ).to(device)
     
