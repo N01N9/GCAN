@@ -69,7 +69,7 @@ class GridMambaBlock(nn.Module):
         if self.dilation > 1:
             pad = (self.dilation - (F % self.dilation)) % self.dilation
             if pad > 0:
-                x_freq = F.pad(x_freq, (0, 0, 0, pad)) # F 차원 패딩
+                x_freq = torch.nn.functional.pad(x_freq, (0, 0, 0, pad)) # F 차원 패딩
             F_pad = x_freq.shape[1]
             
             # Reshape for dilation: [BT, F//D, D, C] -> [BT*D, F//D, C]

@@ -1,0 +1,27 @@
+causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.5.4/causal_conv1d-1.5.4+cu12torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+datasets==2.18.0
+einops==0.8.1
+flake8==7.3.0
+huggingface-hub==0.36.0
+librosa==0.11.0
+mamba-ssm @ https://github.com/state-spaces/mamba/releases/download/v2.2.6.post3/mamba_ssm-2.2.6.post3+cu12torch2.5cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+matplotlib==3.10.8
+ninja==1.13.0
+numpy==2.2.6
+packaging==25.0
+pandas==2.3.3
+pillow==12.1.0
+pytest==9.0.2
+PyYAML
+requests==2.32.5
+scikit-learn==1.7.2
+scipy==1.15.3
+soundfile==0.13.1
+tensorboard==2.20.0
+torch==2.5.1+cu121
+torchaudio==2.5.1+cu121
+TorchCodec==0.1.1
+torchvision==0.20.1
+tqdm==4.67.1
+transformers==4.57.5
+wandb==0.24.0
